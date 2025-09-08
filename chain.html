@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StorageDApp — Upload (Public / Private)</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/web3/1.8.0/web3.min.js"></script>
+  <script src="https://unpkg.com/web3.storage/dist/bundle.min.js"></script>
+  <style>
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#0f1724; color:#e6edf3; padding:20px;}
+    .card{max-width:780px;margin:0 auto;background:#0b1220;padding:20px;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+    input,button,select{padding:10px;border-radius:10px;border:1px solid #263248;background:transparent;color:inherit}
+    .row{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+    .small{font-size:13px;color:#9aa7c0}
+    .output{background:#071028;padding:10px;border-radius:10px;border:1px dashed #263248;min-height:40px}
+    a.copy{cursor:pointer;color:#60a5fa;text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>StorageDApp — Upload (Public / Private)</h2>
+    <p class="small">Note: For <strong>private</strong> uploads this UI encrypts the file in the browser before uploading to IPFS (web3.storage). You must save the decryption key shown after upload — it's required to view the file later.</p>
+
+    <div class="row">
+      <button id="connectBtn">Connect MetaMask</button>
+      <div class="small">Wallet: <span id="wallet">Not connected</span></div>
+    </div>
+
+    <div style="margin-top:8px; margin-bottom:6px">
+      <label class="small">Web3.Storage API Token (required):</label>
+      <div class="row">
+        <input id="w3Token" type="text" placeholder="Paste your web3.storage API token here" style="flex:1" />
+        <button id="saveToken">Save token</button>
+      </div>
+    </div>
+
+    <hr />
+
+    <div class="row">
+      <input id="fileInput" type="file" />
+      <select id="ctype">
+        <option value="image">image</option>
+        <option value="video">video</option>
+        <option value="audio">audio</option>
+        <option value="document">document</option>
+        <option value="text">text</option>
+      </select>
+      <label class="small"><input id="isPrivate" type="checkbox" /> Private (encrypt)</label>
+      <button id="uploadBtn">Upload</button>
+    </div>
+
+    <div style="margin-top:12px">
+      <div class="small">Upload result / messages:</div>
+      <div id="out" class="output">Ready</div>
+    </div>
+
+    <hr />
+
+    <h3>Retrieve / View Item</h3>
+    <div class="row">
+      <input id="itemId" type="number" placeholder="Item ID (uint)" />
+      <button id="fetchBtn">Fetch item info</button>
+      <button id="listBtn">List count</button>
+    </div>
+    <div id="itemOut" class="output">No item loaded</div>
+
+  </div>
+
+<script>
+// ----- CONFIG (you already deployed contract address) -----
+const contractAddress = "0xE1f905511fdEb9B7cFdC8900ECfe998c28a0A336"; // user provided
+const contractABI = [
+  {"inputs":[{"internalType":"string","name":"_cid","type":"string"},{"internalType":"string","name":"_ctype","type":"string"},{"internalType":"bool","name":"_isPrivate","type":"bool"}],"name":"uploadItem","outputs":[],"stateMutability":"nonpayable","type":"function"},
+  {"inputs":[{"internalType":"uint256","name":"_id","type":"uint256"}],"name":"getItem","outputs":[{"internalType":"string","name":"cid","type":"string"},{"internalType":"string","name":"ctype","type":"string"},{"internalType":"address","name":"owner","type":"address"},{"internalType":"bool","name":"isDeleted","type":"bool"},{"internalType":"bool","name":"isPrivate","type":"bool"}],"stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"getItemCount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+  {"inputs":[{"internalType":"uint256","name":"_id","type":"uint256"}],"name":"deleteItem","outputs":[],"stateMutability":"nonpayable","type":"function"}
+];
+
+// ----- State -----
+let web3;
+let account;
+let contract;
+let w3Client = null; // web3.storage client
+
+// ----- Helpers: UI -----
+function setOut(msg){ document.getElementById('out').innerText = msg; }
+function setItemOut(html){ document.getElementById('itemOut').innerHTML = html; }
+
+// ----- MetaMask connect -----
+document.getElementById('connectBtn').addEventListener('click', async ()=>{
+  if(window.ethereum){
+    web3 = new Web3(window.ethereum);
+    try{
+      const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+      account = accounts[0];
+      document.getElementById('wallet').innerText = account;
+      contract = new web3.eth.Contract(contractABI, contractAddress);
+      setOut('Connected to MetaMask: ' + account);
+    }catch(err){ console.error(err); setOut('Connection failed'); }
+  } else { alert('Install MetaMask'); }
+});
+
+// ----- Save web3.storage token -----
+document.getElementById('saveToken').addEventListener('click', ()=>{
+  const t = document.getElementById('w3Token').value.trim();
+  if(!t){ alert('Paste token'); return; }
+  try{ w3Client = new Web3Storage({ token: t }); setOut('web3.storage token saved'); localStorage.setItem('w3token', t);}catch(e){console.error(e); setOut('Invalid token');}
+});
+
+// Try load token from localStorage
+(function(){ const t = localStorage.getItem('w3token'); if(t){ document.getElementById('w3Token').value = t; w3Client = new Web3Storage({ token: t }); }})();
+
+// ----- Crypto helpers: AES-GCM encryption/decryption -----
+async function generateKeyBase64(){
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt','decrypt']);
+  const raw = await crypto.subtle.exportKey('raw', key);
+  return { keyObj: key, keyB64: arrayBufferToBase64(raw) };
+}
+
+async function importKeyFromBase64(b64){
+  const raw = base64ToArrayBuffer(b64);
+  return await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt','decrypt']);
+}
+
+function arrayBufferToBase64(buf){ const bytes = new Uint8Array(buf); let binary = ''; for(let b of bytes) binary += String.fromCharCode(b); return btoa(binary); }
+function base64ToArrayBuffer(b64){ const binary = atob(b64); const len = binary.length; const bytes = new Uint8Array(len); for(let i=0;i<len;i++) bytes[i]=binary.charCodeAt(i); return bytes.buffer; }
+
+async function encryptFile(file){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const { keyObj, keyB64 } = await generateKeyBase64();
+  const array = await file.arrayBuffer();
+  const ciphertext = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, keyObj, array);
+  // build a blob that includes iv + ciphertext for upload
+  const combined = new Uint8Array(iv.byteLength + ciphertext.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ciphertext), iv.byteLength);
+  return { blob: new Blob([combined]), keyB64 };
+}
+
+async function decryptArrayBufferWithKey(buffer, keyB64){
+  const raw = new Uint8Array(buffer);
+  const iv = raw.slice(0,12);
+  const ct = raw.slice(12);
+  const key = await importKeyFromBase64(keyB64);
+  const plain = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, ct);
+  return new Blob([plain]);
+}
+
+// ----- Upload handler -----
+document.getElementById('uploadBtn').addEventListener('click', async ()=>{
+  if(!contract || !account){ alert('Connect MetaMask first'); return; }
+  if(!w3Client){ alert('Provide web3.storage token and press Save token'); return; }
+  const f = document.getElementById('fileInput').files[0];
+  if(!f){ alert('Choose a file'); return; }
+  const ctype = document.getElementById('ctype').value;
+  const isPrivate = document.getElementById('isPrivate').checked;
+
+  setOut('Preparing upload...');
+  try{
+    let fileToUpload = f;
+    let keyB64 = null;
+    if(isPrivate){
+      setOut('Encrypting file in browser (private)...');
+      const enc = await encryptFile(f);
+      fileToUpload = new File([enc.blob], f.name + '.enc');
+      keyB64 = enc.keyB64;
+    }
+
+    setOut('Uploading to web3.storage...');
+    const cid = await w3Client.put([fileToUpload], { wrapWithDirectory: false });
+
+    setOut('IPFS CID: ' + cid + ' — writing to contract...');
+    // call contract.uploadItem(cid, ctype, isPrivate)
+    contract.methods.uploadItem(cid, ctype, isPrivate).send({ from: account })
+      .on('transactionHash', function(hash){ setOut('Tx sent: ' + hash); })
+      .on('receipt', function(receipt){
+        let msg = 'Uploaded. CID: ' + cid + '\nReceipt received.';
+        if(isPrivate){
+          msg += '\n***IMPORTANT*** Save this decryption key now (copy & store):\n' + keyB64;
+          msg += '\nWithout this key you cannot decrypt the private file.';
+        }
+        setOut(msg);
+      })
+      .on('error', function(err){ console.error(err); setOut('Contract tx failed'); });
+
+  }catch(e){ console.error(e); setOut('Upload error: ' + (e.message||e)); }
+});
+
+// ----- Fetch item -----
+document.getElementById('fetchBtn').addEventListener('click', async ()=>{
+  if(!contract){ alert('Connect MetaMask first'); return; }
+  const id = Number(document.getElementById('itemId').value);
+  if(isNaN(id)){ alert('Provide item id'); return; }
+  try{
+    const res = await contract.methods.getItem(id).call();
+    // res: [cid, ctype, owner, isDeleted, isPrivate]
+    const cid = res[0];
+    const ctype = res[1];
+    const owner = res[2];
+    const isDeleted = res[3];
+    const isPrivate = res[4];
+
+    let html = '';
+    html += '<div class="small">Owner: ' + owner + '</div>';
+    html += '<div class="small">Type: ' + ctype + '</div>';
+    html += '<div class="small">Deleted: ' + isDeleted + '</div>';
+    html += '<div class="small">Private: ' + isPrivate + '</div>';
+    html += '<div style="margin-top:6px">';
+    if(!isPrivate){
+      const url = 'https://' + cid + '.ipfs.w3s.link';
+      html += '<div>Public file URL: <a href="'+url+'" target="_blank">' + url + '</a></div>';
+    } else {
+      html += '<div>Private file stored on IPFS (CID visible). To view: owner must provide decryption key.</div>';
+      html += '<div style="margin-top:6px"><button id="downloadPrivateBtn">Download & Decrypt (enter key)</button></div>';
+    }
+    html += '</div>';
+
+    setItemOut(html);
+
+    // attach event after rendering
+    if(isPrivate){
+      setTimeout(()=>{
+        const btn = document.getElementById('downloadPrivateBtn');
+        if(btn) btn.addEventListener('click', async ()=>{
+          const keyB64 = prompt('Paste decryption key (base64) that was shown when you uploaded the file');
+          if(!keyB64){ alert('Key required'); return; }
+          try{
+            setItemOut('Fetching encrypted blob from IPFS (this may take a moment)...');
+            // fetch raw content from web3.storage gateway (not ideal for large files)
+            const resp = await fetch('https://' + cid + '.ipfs.w3s.link');
+            if(!resp.ok) throw new Error('Failed to fetch');
+            const buf = await resp.arrayBuffer();
+            const decBlob = await decryptArrayBufferWithKey(buf, keyB64);
+            // create object URL and open
+            const url = URL.createObjectURL(decBlob);
+            // if image/video/audio, show preview else provide download link
+            let preview = '';
+            if(ctype === 'image') preview = '<img src="'+url+'" style="max-width:100%" />';
+            else if(ctype === 'video') preview = '<video controls src="'+url+'" style="max-width:100%"></video>';
+            else if(ctype === 'audio') preview = '<audio controls src="'+url+'"></audio>';
+            else preview = '<a href="'+url+'" download>Download decrypted file</a>';
+            setItemOut('<div>Decryption success — preview below:</div>' + preview);
+          }catch(e){ console.error(e); setItemOut('Failed to decrypt/fetch: ' + (e.message||e)); }
+        });
+      }, 50);
+    }
+
+  }catch(e){ console.error(e); setItemOut('Fetch failed: ' + (e.message||e)); }
+});
+
+// ----- List count -----
+document.getElementById('listBtn').addEventListener('click', async ()=>{
+  if(!contract){ alert('Connect MetaMask first'); return; }
+  try{
+    const c = await contract.methods.getItemCount().call();
+    setItemOut('Total items: ' + c);
+  }catch(e){ setItemOut('Count failed'); }
+});
+
+</script>
+</body>
+</html>
